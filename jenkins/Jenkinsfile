@@ -1,0 +1,170 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_REGION      = "ap-south-1"
+    ECR_REGISTRY    = "825979908751.dkr.ecr.ap-south-1.amazonaws.com"
+    FRONTEND_REPO   = "${ECR_REGISTRY}/devops-app/frontend"
+    BACKEND_REPO    = "${ECR_REGISTRY}/devops-app/backend"
+    IMAGE_TAG       = "${BUILD_NUMBER}"
+    KUBECONFIG_ID   = "kubeconfig"
+    K8S_NAMESPACE   = "devops-app"
+  }
+
+  stages {
+
+    // ── Stage 1: Checkout ────────────────────────────────────────────────────
+    stage('Checkout') {
+      steps {
+        checkout scm
+        echo "Branch: ${env.BRANCH_NAME ?: 'main'}"
+        echo "Build: #${BUILD_NUMBER}"
+        sh 'git log --oneline -5'
+      }
+    }
+
+    // ── Stage 2: Test Backend ────────────────────────────────────────────────
+    stage('Test Backend') {
+      steps {
+        dir('app/backend') {
+          sh 'npm ci'
+          sh 'npm run test:ci'
+        }
+      }
+      post {
+        always {
+          junit allowEmptyResults: true, testResults: 'app/backend/junit.xml'
+        }
+      }
+    }
+
+    // ── Stage 3: Test Frontend ───────────────────────────────────────────────
+    stage('Test Frontend') {
+      steps {
+        dir('app/frontend') {
+          sh 'npm ci'
+          sh 'npm test -- --watchAll=false --ci --passWithNoTests'
+        }
+      }
+    }
+
+    // ── Stage 4: Build Docker Images ─────────────────────────────────────────
+    stage('Build Images') {
+      steps {
+        sh """
+          echo "Building backend image..."
+          docker build \
+            -t ${BACKEND_REPO}:${IMAGE_TAG} \
+            -t ${BACKEND_REPO}:latest \
+            ./app/backend
+
+          echo "Building frontend image..."
+          docker build \
+            -t ${FRONTEND_REPO}:${IMAGE_TAG} \
+            -t ${FRONTEND_REPO}:latest \
+            ./app/frontend
+
+          echo "Images built successfully."
+          docker images | grep devops-app
+        """
+      }
+    }
+
+    // ── Stage 5: Push to Amazon ECR ──────────────────────────────────────────
+    stage('Push to ECR') {
+      steps {
+        sh """
+          aws ecr get-login-password --region ${AWS_REGION} | \
+            docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+          docker push ${BACKEND_REPO}:${IMAGE_TAG}
+          docker push ${BACKEND_REPO}:latest
+
+          docker push ${FRONTEND_REPO}:${IMAGE_TAG}
+          docker push ${FRONTEND_REPO}:latest
+
+          echo "Images pushed to ECR successfully."
+        """
+      }
+    }
+
+    // ── Stage 6: Deploy to Kubernetes ────────────────────────────────────────
+    stage('Deploy to Kubernetes') {
+      steps {
+        withCredentials([file(credentialsId: "${KUBECONFIG_ID}", variable: 'KUBECONFIG')]) {
+          sh """
+            export KUBECONFIG=${KUBECONFIG}
+
+            # Apply namespace and base manifests
+            kubectl apply -f k8s/namespace.yaml
+
+            # Deploy database layer first
+            kubectl apply -f k8s/database/
+
+            # Deploy backend
+            kubectl apply -f k8s/backend/
+
+            # Deploy frontend
+            kubectl apply -f k8s/frontend/
+
+            # Deploy ingress
+            kubectl apply -f k8s/ingress/
+
+            # Update images to trigger rolling update
+            kubectl set image deployment/backend \
+              backend=${BACKEND_REPO}:${IMAGE_TAG} \
+              -n ${K8S_NAMESPACE}
+
+            kubectl set image deployment/frontend \
+              frontend=${FRONTEND_REPO}:${IMAGE_TAG} \
+              -n ${K8S_NAMESPACE}
+
+            # Wait for rollouts to complete
+            echo "Waiting for backend rollout..."
+            kubectl rollout status deployment/backend -n ${K8S_NAMESPACE} --timeout=180s
+
+            echo "Waiting for frontend rollout..."
+            kubectl rollout status deployment/frontend -n ${K8S_NAMESPACE} --timeout=180s
+
+            # Show final pod status
+            kubectl get pods -n ${K8S_NAMESPACE}
+          """
+        }
+      }
+    }
+
+    // ── Stage 7: Smoke Test ───────────────────────────────────────────────────
+    stage('Smoke Test') {
+      steps {
+        sh """
+          echo "Waiting for services to stabilize..."
+          sleep 15
+
+          echo "Testing frontend..."
+          curl -f --retry 5 --retry-delay 5 http://52.66.148.69:30080 || exit 1
+
+          echo "Testing backend health..."
+          curl -f --retry 5 --retry-delay 5 http://52.66.148.69:30081/health || exit 1
+
+          echo "Smoke tests passed!"
+        """
+      }
+    }
+  }
+
+  post {
+    always {
+      // Clean up local Docker images to free disk space
+      sh """
+        docker rmi ${BACKEND_REPO}:${IMAGE_TAG}  || true
+        docker rmi ${FRONTEND_REPO}:${IMAGE_TAG} || true
+      """
+    }
+    success {
+      echo "✅ Pipeline SUCCESS — Build #${BUILD_NUMBER} deployed to Kubernetes"
+    }
+    failure {
+      echo "❌ Pipeline FAILED — Build #${BUILD_NUMBER}. Check console output above."
+    }
+  }
+}
