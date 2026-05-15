@@ -25,7 +25,7 @@ spec:
       containers:
         - name: frontend
           # Jenkins replaces this tag on each deploy via kubectl set image
-          image: 825979908751.dkr.ecr.ap-south-1.amazonaws.com/devops-app/frontend:latest
+          image: <ACCOUNT_ID>.dkr.ecr.ap-south-1.amazonaws.com/devops-app/frontend:latest
           ports:
             - containerPort: 80
           resources:
