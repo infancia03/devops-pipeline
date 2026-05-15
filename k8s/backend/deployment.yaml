@@ -25,7 +25,7 @@ spec:
       containers:
         - name: backend
           # Jenkins replaces this tag on each deploy via kubectl set image
-          image: 825979908751.dkr.ecr.ap-south-1.amazonaws.com/devops-app/backend:latest
+          image: <ACCOUNT_ID>.dkr.ecr.ap-south-1.amazonaws.com/devops-app/backend:latest
           ports:
             - containerPort: 3000
           envFrom:
